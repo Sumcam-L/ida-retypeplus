@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.idb
+*.i64
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.log
+.DS_Store
+Thumbs.db
