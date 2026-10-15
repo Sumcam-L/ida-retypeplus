@@ -32,12 +32,18 @@ present in the TIL can be applied.
 
 ## What it also fixes
 
-Two things that broke in IDA 9.4 while making this work:
+Three retyping paths that IDA 9.4 breaks or that never persisted:
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | `Sorry, cannot change argument type.` / `Please edit the function prototype instead` | 9.4 refuses `vdui_t.set_lvar_type()` for function arguments | rewrite the prototype via `tinfo_t.set_funcarg_type()` + `apply_tinfo()` |
+| `Sorry, cannot change variable type` | `set_lvar_type()` returns false when the new type does not fit the variable's register or stack slot | fall back to persistent `modify_user_lvar_info(MLI_TYPE)`, which lets the decompiler re-lay-out |
 | Changing a struct member silently does nothing | the old code mutated a throwaway in-memory copy of the `tinfo_t` | rebuild the struct and write it back with `set_named_type()` |
+
+The local-variable fallback verifies the change actually landed. `set_lvar_type()`
+and `modify_user_lvar_info()` can both report success while nothing changes, so the
+plugin confirms the new type is really present before claiming victory — and says so
+when a variable genuinely cannot hold the requested type.
 
 ## Install
 
@@ -73,7 +79,7 @@ Where the cursor is decides what gets retyped:
 
 | Window | Cursor on | Result |
 | --- | --- | --- |
-| Pseudocode | a local variable | `set_lvar_type` |
+| Pseudocode | a local variable | `set_lvar_type`, with a persistent fallback |
 | Pseudocode | a **function argument** | function prototype is rewritten |
 | Pseudocode | a global / expression | `apply_tinfo` at that address |
 | Local Types | a struct/union member | struct is rebuilt with the new member type |
@@ -105,13 +111,16 @@ __int64 __fastcall consume(std::_Func_base<char const *> *a1)
 - **It only resolves types that already exist.** This is a lookup by name, not a
   declaration parser, so it cannot invent a type. Import the PDB (or otherwise
   create the type) first — that is exactly the situation it targets.
+- **A local variable can only hold what its slot allows.** If the decompiler placed
+  a variable in a register, you cannot turn a 4-byte int into a 64-byte struct there;
+  the plugin reports this instead of failing silently.
 - **Changing a member's size re-lays-out the struct.** Later members shift, as they
   would with any type change. The plugin warns about this in the log; check the
   layout in the Structures window (`Shift+F1`) if offsets matter.
 - **Struct/union members only, not function members** of a struct in the Local Types
   window.
 - Tested with **IDA Professional 9.4** (`hexrays 9.4.0.260714`). The `<>` lookup path
-  is version-independent, but the argument/prototype behaviour is specific to 9.4+.
+  is version-independent, but the argument/local variable behaviour is specific to 9.4+.
 
 ## Requirements
 

@@ -15,8 +15,8 @@ This plugin resolves types with tinfo_t.get_named_type() instead of parsing
 a declaration, so those names work. It behaves like Y, but accepts anything
 that already exists in the type library.
 
-Also fixes two IDA 9.4 regressions
-----------------------------------
+Also fixes three IDA 9.4 retyping problems
+-----------------------------------------
 1. Retyping a function argument used to go through vdui_t.set_lvar_type().
    IDA 9.4 refuses that for arguments with:
 
@@ -26,7 +26,16 @@ Also fixes two IDA 9.4 regressions
    The plugin now rewrites the function prototype instead
    (tinfo_t.set_funcarg_type() + apply_tinfo()), as IDA demands.
 
-2. Retyping a struct member used to mutate a throwaway in-memory copy of
+2. Retyping a local variable could fail with:
+
+       Sorry, cannot change variable type
+
+   vdui_t.set_lvar_type() returns false whenever the new type does not fit
+   the variable's register or stack slot. The plugin falls back to the
+   persistent modify_user_lvar_info(MLI_TYPE) path, which lets the
+   decompiler re-lay-out, and then verifies the change actually landed.
+
+3. Retyping a struct member used to mutate a throwaway in-memory copy of
    the tinfo_t, so nothing was ever saved. The plugin now rebuilds the
    struct and writes it back to the TIL.
 
@@ -183,6 +192,14 @@ def apply_to_funcarg(vu, func_ea, arg_index, new_tif, display_name):
     if proto is None:
         return False, "cannot get the current function prototype"
 
+    # 已经是这个类型了：直接算成功，免得重复应用时报错
+    try:
+        cur = proto.get_nth_arg(arg_index)
+        if not cur.empty() and cur == new_tif:
+            return True, display_name
+    except Exception:
+        pass
+
     patched = proto.copy()
     rc = patched.set_funcarg_type(arg_index, new_tif, 0)
     if int(rc) != ida_typeinf.TERR_OK:
@@ -199,6 +216,93 @@ def apply_to_funcarg(vu, func_ea, arg_index, new_tif, display_name):
         pass
 
     return True, display_name
+
+
+# ------------------------------------------------------------
+# 场景 B：把类型应用到“局部变量”上
+# 无脑调 vdui_t.set_lvar_type() 在 9.4 会失败并弹
+# "Sorry, cannot change variable type"（例如寄存器局部变量、
+# 或者新类型在当前栈槽/寄存器里放不下）。失败时改用持久化的
+# modify_user_lvar_info(MLI_TYPE)，它能让反编译器重新布局。
+# 返回 (ok, message)；ok=True 时类型已经生效并落库。
+# ------------------------------------------------------------
+def apply_to_lvar(vu, func_ea, lvar, new_tif, display_name):
+    """返回值 (ok, message)。ok=True 时调用方还需要 vu.refresh_view(True)。
+
+    注意：这里绝对不能调用 mark_cfunc_dirty()。它会连同 vdui 的
+    cfunc 一起失效，之后调用方再 refresh_view() 会让 IDA 直接崩溃
+    （实测 exit 139）。让 refresh_view(True) 自己重新反编译即可。
+    """
+    if not tif_is_usable(new_tif):
+        return False, "invalid (empty) target type"
+
+    name = lvar.name or "?"
+
+    # 1) 首选：vdui 路径（和 Y 键一致）。成功时视图仍然有效，
+    #    直接比对内存里的 lvar.tif 就能确认。
+    try:
+        if vu.set_lvar_type(lvar, new_tif) and lvar_type_matches(lvar, new_tif):
+            return True, name
+    except Exception:
+        pass
+
+    # 2) 兜底：持久化用户变量信息，让反编译器重新布局。
+    #    对寄存器局部变量等放不下的情况，底层会返回 True 却什么都不改，
+    #    因此必须靠“目标类型出现次数变多”来判定，不能信返回值。
+    before = count_lvars_with_type(func_ea, new_tif)
+    try:
+        mli = ida_hexrays.lvar_saved_info_t()
+        mli.ll = lvar
+        mli.type = new_tif
+        mli.size = -1
+        mli.name = lvar.name
+        rc = ida_hexrays.modify_user_lvar_info(func_ea, ida_hexrays.MLI_TYPE, mli)
+    except Exception as e:
+        return False, "modify_user_lvar_info raised %r" % (e,)
+
+    if not rc:
+        return False, "cannot change type of %s (modify_user_lvar_info failed)" % name
+
+    if count_lvars_with_type(func_ea, new_tif) > before:
+        return True, name
+
+    # 真的没改成；把这次无效的用户信息撤掉，免得留脏数据
+    try:
+        mli.type = lvar.tif
+        ida_hexrays.modify_user_lvar_info(func_ea, ida_hexrays.MLI_TYPE, mli)
+    except Exception:
+        pass
+    return False, ("cannot change type of %s; the variable cannot hold %s "
+                   "(register/stack slot too small)" % (name, display_name))
+
+
+def lvar_type_matches(lvar, new_tif):
+    """当前 lvar 的类型是否已经是目标类型。"""
+    try:
+        return lvar.tif == new_tif
+    except Exception:
+        try:
+            return lvar.tif.dstr() == new_tif.dstr()
+        except Exception:
+            return False
+
+
+def count_lvars_with_type(func_ea, tif):
+    """函数局部变量里，当前类型等于 tif 的个数。
+
+    改名（v4 -> var8 之类）之后按名字找已经不准了，用计数更可靠。
+    """
+    n = 0
+    try:
+        cf = ida_hexrays.decompile(func_ea)
+        if cf is None:
+            return 0
+        for i in range(len(cf.lvars)):
+            if lvar_type_matches(cf.lvars[i], tif):
+                n += 1
+    except Exception:
+        return 0
+    return n
 
 
 # ------------------------------------------------------------
@@ -246,12 +350,13 @@ def apply_in_pseudocode(type_name):
             vu.refresh_view(True)
             return True
 
-        # 普通局部变量：仍走 set_lvar_type
-        if vu.set_lvar_type(lvar, tif):
+        # 普通局部变量
+        ok, info = apply_to_lvar(vu, func_ea, lvar, tif, display_name)
+        if ok:
             vu.refresh_view(True)
             ida_kernwin.msg(f"[+] {lvar.name} : {display_name}\n")
         else:
-            ida_kernwin.msg(f"[!] Failed to set type of {lvar.name}\n")
+            ida_kernwin.msg(f"[!] {info}\n")
         return True
 
     if item.citype == ida_hexrays.VDI_EXPR:
@@ -281,11 +386,12 @@ def apply_in_pseudocode(type_name):
                     vu.refresh_view(True)
                     return True
 
-                if vu.set_lvar_type(lvar, tif):
+                ok, info = apply_to_lvar(vu, func_ea, lvar, tif, display_name)
+                if ok:
                     vu.refresh_view(True)
                     ida_kernwin.msg(f"[+] {lvar.name} : {display_name}\n")
                 else:
-                    ida_kernwin.msg(f"[!] Failed to set type of {lvar.name}\n")
+                    ida_kernwin.msg(f"[!] {info}\n")
                 return True
 
     ida_kernwin.msg("[*] Pseudocode: not on a variable/expression\n")
